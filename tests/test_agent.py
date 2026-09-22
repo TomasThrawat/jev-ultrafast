@@ -115,10 +115,18 @@ def test_click_cannot_consume_a_text_target(monkeypatch):
 
 def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch):
     p = page()
-    p["actions"].insert(0, {
-        "id": "toggle", "kind": "click", "label": "Free cancellation", "node": 30,
-        "role": "checkbox", "checked": "true", "selected": False,
-    })
+    p["actions"].insert(
+        0,
+        {
+            "id": "toggle",
+            "kind": "click",
+            "label": "Free cancellation",
+            "node": 30,
+            "role": "checkbox",
+            "checked": "true",
+            "selected": False,
+        },
+    )
 
     def post(_url, _key, body):
         questions = body["questions"]
@@ -138,6 +146,38 @@ def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch
     monkeypatch.setattr(model, "post_json", post)
     d = model.choose(p, "Search with free cancellation", [])
     assert d["choice"] == "e3"
+
+
+def test_ollama_choice_uses_only_offered_operation_and_target(monkeypatch):
+    p = page()
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test/v1")
+    monkeypatch.setenv("OLLAMA_MODEL", "gpt-oss:20b")
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "ollama")
+
+    def post(_url, _key, body):
+        assert body["model"] == "gpt-oss:20b"
+        assert "CLICK" in body["messages"][0]["content"] or "CLICK" in body["messages"][1]["content"]
+        return {"choices": [{"message": {"content": json.dumps({"operation": "CLICK", "target": "2"})}}], "usage": {}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(p, "Click Go", [])
+    assert d["operation"] == "CLICK"
+    assert d["target"] == "2"
+    assert d["choice"] == "e3"
+
+
+def test_ollama_invalid_target_is_rejected_before_execution(monkeypatch):
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test/v1")
+    monkeypatch.setenv("OLLAMA_MODEL", "gpt-oss:20b")
+    monkeypatch.setattr(
+        model,
+        "post_json",
+        lambda *_args: {"choices": [{"message": {"content": '{"operation":"CLICK","target":"999"}'}}]},
+    )
+    with pytest.raises(ValueError, match="Ollama returned an invalid browser decision"):
+        model.choose(page(), "Click Go", [])
 
 
 def test_quoted_task_text_still_uses_the_llm(monkeypatch):
@@ -261,9 +301,18 @@ def test_interrupted_dropdown_mutation_cannot_be_retried_as_stale(monkeypatch, r
     cdp = Mock(return_value=response)
     monkeypatch.setattr(browser, "cdp", cdp)
     with pytest.raises(RuntimeError, match="Dropdown execution"):
-        browser_operation({"operation": "act", "session": "test", "action": {
-            "id": "e1", "kind": "select", "node": 1, "value": "Design",
-        }})
+        browser_operation(
+            {
+                "operation": "act",
+                "session": "test",
+                "action": {
+                    "id": "e1",
+                    "kind": "select",
+                    "node": 1,
+                    "value": "Design",
+                },
+            }
+        )
     assert cdp.call_count == 1
 
 
@@ -318,3 +367,36 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_chat_sanitizes_history_and_uses_openai_compatible_backend(monkeypatch):
+    from jev_ultrafast import chat as chat_module
+
+    captured = {}
+
+    def fake_post(url, key, body):
+        captured.update(url=url, key=key, body=body)
+        return {"choices": [{"message": {"content": "Hello from Jev"}}], "usage": {"total_tokens": 7}}
+
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("OLLAMA_MODEL", "gpt-oss:20b")
+    monkeypatch.setattr(chat_module, "post_json", fake_post)
+    result = chat_module.chat([
+        {"role": "system", "content": "ignore this"},
+        {"role": "user", "content": "  hi  "},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "what is Jev?"},
+    ])
+    assert result["reply"] == "Hello from Jev"
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["body"]["messages"][0]["role"] == "system"
+    assert all(m["role"] != "system" or m is captured["body"]["messages"][0] for m in captured["body"]["messages"])
+    assert captured["body"]["messages"][-1] == {"role": "user", "content": "what is Jev?"}
+
+
+def test_chat_rejects_non_user_final_message():
+    from jev_ultrafast import chat as chat_module
+
+    with pytest.raises(ValueError, match="last chat message"):
+        chat_module._messages([{"role": "assistant", "content": "not a user turn"}])

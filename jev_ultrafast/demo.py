@@ -1,4 +1,4 @@
-"""Loopback-only inspector for the Jev browser agent."""
+"""Inspector and local chat endpoint for the Jev browser agent."""
 
 import atexit
 import json
@@ -10,14 +10,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .agent import Agent
+from .chat import chat
 from .questions import MAX_STEPS
 
 ROOT = Path(__file__).parent
-PORT = int(os.environ.get("TYPESAFE_DEMO_PORT", "8766"))
-ORIGIN = f"http://127.0.0.1:{PORT}"
-TOKEN = secrets.token_urlsafe(32)
-LOCK = threading.Lock()
-AGENT = None
 
 
 def load_environment():
@@ -27,6 +23,17 @@ def load_environment():
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
                 os.environ.setdefault(key, value)
+
+
+load_environment()
+PORT = int(os.environ.get("TYPESAFE_DEMO_PORT", "8766"))
+BIND_HOST = os.environ.get("JEV_BIND_HOST", "127.0.0.1")
+ALLOW_NETWORK = os.environ.get("JEV_ALLOW_NETWORK", "0").lower() in {"1", "true", "yes"}
+ORIGIN = f"http://127.0.0.1:{PORT}"
+TOKEN = secrets.token_urlsafe(32)
+LOCK = threading.Lock()
+CHAT_LOCK = threading.Lock()
+AGENT = None
 
 
 def response_state():
@@ -39,6 +46,12 @@ def close_browser():
     if AGENT:
         AGENT.close()
         AGENT = None
+
+
+def allowed_host(host):
+    if ALLOW_NETWORK:
+        return True
+    return host in {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 
 
 def command(name, body):
@@ -79,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(content)
 
     def do_GET(self):
-        if self.headers.get("Host") != f"127.0.0.1:{PORT}":
+        if not allowed_host(self.headers.get("Host", "")):
             return self.send(403, "Forbidden", "text/plain")
         path = urlparse(self.path).path
         if path == "/api/state":
@@ -102,9 +115,28 @@ class Handler(BaseHTTPRequestHandler):
         self.send(200, content, mime + "; charset=utf-8")
 
     def do_POST(self):
+        if not allowed_host(self.headers.get("Host", "")):
+            return self.send(403, json.dumps({"error": "Host not allowed"}))
+        path = urlparse(self.path).path
+        if path == "/api/chat":
+            if not CHAT_LOCK.acquire(blocking=False):
+                return self.send(409, json.dumps({"error": "A chat response is already running"}))
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length < 120000:
+                    raise ValueError("Invalid request size")
+                body = json.loads(self.rfile.read(length))
+                result = chat(body.get("messages"))
+                self.send(200, json.dumps(result, ensure_ascii=False))
+            except (ValueError, RuntimeError, TimeoutError) as error:
+                self.send(400, json.dumps({"error": str(error)}, ensure_ascii=False))
+            except Exception:
+                self.send(500, json.dumps({"error": "Chat backend failed; no automatic retry."}, ensure_ascii=False))
+            finally:
+                CHAT_LOCK.release()
+            return
         if (
-            self.headers.get("Host") != f"127.0.0.1:{PORT}"
-            or self.headers.get("X-Demo-Token") != TOKEN
+            self.headers.get("X-Demo-Token") != TOKEN
             or self.headers.get("Origin") not in (None, ORIGIN)
         ):
             return self.send(403, json.dumps({"error": "Local demo requests only"}))
@@ -115,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length < 8192:
                 raise ValueError("Invalid request size")
             body = json.loads(self.rfile.read(length))
-            result = command(self.path.removeprefix("/api/"), body)
+            result = command(path.removeprefix("/api/"), body)
             self.send(200, json.dumps(result))
         except (ValueError, RuntimeError, TimeoutError) as error:
             self.send(400, json.dumps({"error": str(error)}))
@@ -129,9 +161,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    load_environment()
     atexit.register(close_browser)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     print(f"Jev Ultrafast: {ORIGIN}", flush=True)
     try:
         server.serve_forever()

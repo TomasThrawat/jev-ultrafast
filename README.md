@@ -67,6 +67,16 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
 
+### Ollama
+### Android chat
+
+The server now exposes `POST /api/chat` using the configured OpenAI-compatible text model. With the free/local Ollama path, set `LLM_PROVIDER=ollama`, `OLLAMA_BASE_URL`, and `OLLAMA_MODEL`.
+
+For an Android device on the same trusted LAN, run with `JEV_BIND_HOST=0.0.0.0` and `JEV_ALLOW_NETWORK=1`, then point the Kotlin app at `http://<computer-lan-ip>:8766/api/chat`. The chat history stays in the app memory and is not persisted by the Android client.
+
+
+The demo can use an OpenAI-compatible Ollama endpoint without TypeSafe for the decision policy. Set `LLM_PROVIDER=ollama`, `OLLAMA_BASE_URL`, and `OLLAMA_MODEL`. The local default is `http://127.0.0.1:11434/v1`; use a reachable Ollama endpoint when Jev runs in another environment.
+
 ## Use the library
 
 ```python
